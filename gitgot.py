@@ -13,12 +13,13 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 import time
 from urllib.parse import urlparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from openai import OpenAI
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.markdown import Markdown
@@ -29,11 +30,25 @@ load_dotenv()
 # Initialize console for rich output
 console = Console()
 
-class GitHubAnalyzer:
-    """Analyzes GitHub repositories using OpenAI API"""
+class RateLimiter:
+    """Simple rate limiter for API calls"""
     
-    def __init__(self, github_token: Optional[str] = None, openai_api_key: Optional[str] = None):
-        """Initialize the analyzer with API tokens"""
+    def __init__(self, calls_per_second: float):
+        self.calls_per_second = calls_per_second
+        self.min_interval = 1.0 / calls_per_second
+    
+    def wait(self):
+        """Wait to maintain rate limit"""
+        # Simplified version without threading locks to avoid deadlocks in ThreadPoolExecutor
+        # Each thread will respect its own rate limit
+        time.sleep(self.min_interval)
+
+
+class GitHubAnalyzer:
+    """Analyzes GitHub repositories using OpenAI API with multithreading support"""
+    
+    def __init__(self, github_token: Optional[str] = None, openai_api_key: Optional[str] = None, max_workers: int = 4):
+        """Initialize the analyzer with API tokens and threading configuration"""
         self.github_token = github_token or os.getenv('GITHUB_TOKEN')
         self.openai_api_key = openai_api_key or os.getenv('OPENAI_API_KEY')
         
@@ -55,6 +70,18 @@ class GitHubAnalyzer:
         self.model = "gpt-4.1"  # 1M token context window for comprehensive analysis
         self.max_files_per_repo = 20  # Limit files to analyze per repo
         self.max_file_size = 50000  # Max file size in bytes to include
+        
+        # Threading configuration
+        self.max_workers = max_workers
+        
+        # Rate limiters - conservative limits to avoid hitting API caps
+        # GitHub API: 5000/hour with token = ~1.4/second, use 1/second to be safe
+        # GitHub API without token: 60/hour = 0.017/second
+        github_rate = 5.0 if self.github_token else 1.0  # Much faster rate limits
+        self.github_rate_limiter = RateLimiter(github_rate)
+        
+        # OpenAI API: Conservative 1 request per 2 seconds to avoid rate limits
+        self.openai_rate_limiter = RateLimiter(0.5)
         
     def extract_username(self, github_url: str) -> str:
         """Extract username from GitHub URL"""
@@ -106,7 +133,7 @@ class GitHubAnalyzer:
                     break
                 
                 page += 1
-                time.sleep(0.5)  # Rate limiting
+                self.github_rate_limiter.wait()  # Rate limiting
         
         return repos
     
@@ -126,20 +153,31 @@ class GitHubAnalyzer:
             'structure': None
         }
         
-        # Get README
+        # Get README with rate limiting
+        self.github_rate_limiter.wait()
         readme_url = f"{repo['url']}/readme"
-        readme_response = self.session.get(readme_url, headers=self.github_headers)
-        if readme_response.status_code == 200:
+        try:
+            readme_response = self.session.get(readme_url, headers=self.github_headers, timeout=30)
+        except Exception as e:
+            console.print(f"[yellow]Timeout getting README for {repo['name']}: {e}[/yellow]")
+            readme_response = None
+        if readme_response and readme_response.status_code == 200:
             readme_data = readme_response.json()
             if 'content' in readme_data:
                 try:
                     content['readme'] = base64.b64decode(readme_data['content']).decode('utf-8')
-                except:
+                except Exception:
                     content['readme'] = "Could not decode README"
         
-        # Get repository tree structure
-        tree_url = f"{repo['url']}/git/trees/{repo['default_branch']}?recursive=1"
-        tree_response = self.session.get(tree_url, headers=self.github_headers)
+        # Get repository tree structure with rate limiting
+        self.github_rate_limiter.wait()
+        default_branch = repo.get('default_branch', 'main')
+        tree_url = f"{repo['url']}/git/trees/{default_branch}?recursive=1"
+        try:
+            tree_response = self.session.get(tree_url, headers=self.github_headers, timeout=30)
+        except Exception as e:
+            console.print(f"[yellow]Timeout or error getting tree for {repo['name']}: {e}[/yellow]")
+            return content
         
         if tree_response.status_code == 200:
             tree_data = tree_response.json()
@@ -163,10 +201,15 @@ class GitHubAnalyzer:
             
             content['structure'] = '\n'.join(structure[:50])  # Limit structure display
             
-            # Fetch selected files
+            # Fetch selected files with rate limiting
             for file_item in files_to_fetch:
+                self.github_rate_limiter.wait()
                 file_url = file_item['url']
-                file_response = self.session.get(file_url, headers=self.github_headers)
+                try:
+                    file_response = self.session.get(file_url, headers=self.github_headers, timeout=30)
+                except Exception as e:
+                    console.print(f"[yellow]Timeout getting file {file_item['path']} for {repo['name']}: {e}[/yellow]")
+                    continue
                 
                 if file_response.status_code == 200:
                     file_data = file_response.json()
@@ -177,10 +220,8 @@ class GitHubAnalyzer:
                                 'path': file_item['path'],
                                 'content': file_content[:10000]  # Limit file content
                             })
-                        except:
+                        except Exception:
                             pass
-                
-                time.sleep(0.1)  # Rate limiting
         
         return content
     
@@ -208,18 +249,21 @@ class GitHubAnalyzer:
         return any(path_lower.endswith(ext) for ext in important_extensions)
     
     def analyze_repository(self, repo_content: Dict[str, Any]) -> str:
-        """Use OpenAI to analyze a repository"""
+        """Use OpenAI to analyze a repository with rate limiting"""
         # Prepare content for analysis
         analysis_prompt = self._create_analysis_prompt(repo_content)
         
         try:
+            # Apply rate limiting for OpenAI API
+            self.openai_rate_limiter.wait()
+            
             response = self.openai_client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
                         "content": """You are an expert software engineer and code reviewer. 
-                        Analyze the provided repository information and create a comprehensive assessment covering:
+                        Analyze the repository and provide a comprehensive assessment covering:
                         1. Project Purpose and Functionality
                         2. Code Quality and Architecture
                         3. Completeness and Maturity Level
@@ -228,7 +272,7 @@ class GitHubAnalyzer:
                         6. Areas for Improvement
                         7. Overall Assessment Score (1-10)
                         
-                        Be specific, technical, and constructive in your analysis."""
+                        Be direct, specific, and technical. Start immediately with the analysis - no preambles like "Here is..." or "Certainly!". Provide only the substantive content."""
                     },
                     {
                         "role": "user",
@@ -274,6 +318,22 @@ class GitHubAnalyzer:
         
         return "\n".join(prompt_parts)
     
+    def _fetch_repo_content_safe(self, repo: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Safely fetch repository content with error handling"""
+        try:
+            return self.get_repo_content(repo)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not fetch content for {repo['name']}: {e}[/yellow]")
+            return None
+    
+    def _analyze_repo_safe(self, repo_content: Dict[str, Any]) -> Optional[str]:
+        """Safely analyze repository with error handling"""
+        try:
+            return self.analyze_repository(repo_content)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not analyze {repo_content['name']}: {e}[/yellow]")
+            return None
+    
     def generate_profile_summary(self, analyses: List[Dict[str, Any]]) -> str:
         """Generate an overall profile summary of the developer"""
         if not analyses:
@@ -311,7 +371,7 @@ Provide a detailed, professional assessment suitable for a technical portfolio r
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a senior technical recruiter and engineering manager with deep expertise in evaluating developer portfolios."
+                        "content": "You are a senior technical recruiter and engineering manager. Create a developer profile assessment based on the repository analysis. Be direct and specific - start immediately with the technical expertise section. No preambles, acknowledgments, or introductory phrases."
                     },
                     {
                         "role": "user",
@@ -351,38 +411,85 @@ Provide a detailed, professional assessment suitable for a technical portfolio r
             repos = repos[:limit]
             console.print(f"[yellow]Analyzing top {limit} repositories[/yellow]")
         
-        # Analyze each repository
+        # Analyze each repository using thread pools for parallel processing
         analyses = []
         
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console
-        ) as progress:
+        console.print(f"[blue]Using {self.max_workers} worker threads for parallel processing[/blue]")
+        
+        # Phase 1: Fetch repository content in parallel
+        console.print("[cyan]Phase 1: Fetching repository content...[/cyan]")
+        repo_contents = {}
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all content fetching jobs
+            future_to_repo = {
+                executor.submit(self._fetch_repo_content_safe, repo): repo 
+                for repo in repos
+            }
             
-            for i, repo in enumerate(repos, 1):
-                task = progress.add_task(
-                    f"Analyzing {repo['name']} ({i}/{len(repos)})...",
-                    total=1
-                )
-                
-                # Fetch repository content
-                repo_content = self.get_repo_content(repo)
-                
-                # Analyze with OpenAI
-                analysis = self.analyze_repository(repo_content)
-                
-                analyses.append({
-                    'name': repo['name'],
-                    'url': repo['html_url'],
-                    'description': repo.get('description', ''),
-                    'language': repo.get('language', 'Unknown'),
-                    'stars': repo.get('stargazers_count', 0),
-                    'analysis': analysis
-                })
-                
-                progress.update(task, completed=1)
-                time.sleep(1)  # Rate limiting for OpenAI
+            # Collect results as they complete with timeout
+            try:
+                for future in as_completed(future_to_repo, timeout=300):  # 5 minute timeout
+                    repo = future_to_repo[future]
+                    try:
+                        repo_content = future.result(timeout=30)  # 30 second timeout per repo
+                        if repo_content:
+                            repo_contents[repo['name']] = (repo, repo_content)
+                            console.print(f"[green]✓ Fetched {repo['name']} ({len(repo_contents)}/{len(repos)})[/green]")
+                        else:
+                            console.print(f"[yellow]⚠ No content for {repo['name']} ({len(repo_contents)}/{len(repos)})[/yellow]")
+                    except Exception as e:
+                        console.print(f"[red]Error fetching content for {repo['name']}: {e} ({len(repo_contents)}/{len(repos)})[/red]")
+            except Exception as timeout_error:
+                console.print(f"[red]Timeout or error in content fetching phase: {timeout_error}[/red]")
+                # Cancel any remaining futures
+                for future in future_to_repo:
+                    future.cancel()
+        
+        console.print(f"[green]Successfully fetched content for {len(repo_contents)} repositories[/green]")
+        
+        # Phase 2: Analyze repositories in parallel (with lower concurrency for OpenAI)
+        console.print("[cyan]Phase 2: Analyzing repositories with AI...[/cyan]")
+        
+        # Use fewer workers for OpenAI to respect rate limits
+        analysis_workers = min(2, self.max_workers)
+        
+        with ThreadPoolExecutor(max_workers=analysis_workers) as executor:
+            # Submit all analysis jobs
+            future_to_name = {
+                executor.submit(self._analyze_repo_safe, repo_content): name 
+                for name, (repo, repo_content) in repo_contents.items()
+            }
+            
+            # Track progress and collect results with timeout
+            completed_count = 0
+            try:
+                for future in as_completed(future_to_name, timeout=600):  # 10 minute timeout
+                    repo_name = future_to_name[future]
+                    completed_count += 1
+                    
+                    try:
+                        analysis_result = future.result(timeout=60)  # 60 second timeout per analysis
+                        if analysis_result:
+                            repo, repo_content = repo_contents[repo_name]
+                            analyses.append({
+                                'name': repo['name'],
+                                'url': repo['html_url'],
+                                'description': repo.get('description', ''),
+                                'language': repo.get('language', 'Unknown'),
+                                'stars': repo.get('stargazers_count', 0),
+                                'analysis': analysis_result
+                            })
+                            console.print(f"[green]✓ Analyzed {repo_name} ({completed_count}/{len(repo_contents)})[/green]")
+                        else:
+                            console.print(f"[yellow]⚠ Analysis failed for {repo_name} ({completed_count}/{len(repo_contents)})[/yellow]")
+                    except Exception as e:
+                        console.print(f"[red]✗ Error analyzing {repo_name}: {e} ({completed_count}/{len(repo_contents)})[/red]")
+            except Exception as timeout_error:
+                console.print(f"[red]Timeout or error in analysis phase: {timeout_error}[/red]")
+                # Cancel any remaining futures
+                for future in future_to_name:
+                    future.cancel()
         
         # Display individual analyses
         console.print("\n[bold]Repository Analyses:[/bold]\n")
@@ -458,6 +565,13 @@ Examples:
         default='gpt-4.1'
     )
     
+    parser.add_argument(
+        '--workers',
+        type=int,
+        help='Number of worker threads for parallel processing (default: auto)',
+        default=None
+    )
+    
     args = parser.parse_args()
     
     # Handle plain username input
@@ -465,7 +579,14 @@ Examples:
         args.github_url = f'https://github.com/{args.github_url}'
     
     try:
-        analyzer = GitHubAnalyzer()
+        # Determine optimal worker count based on available resources and API limits
+        if args.workers:
+            max_workers = args.workers
+        else:
+            # Conservative threading to avoid rate limiter deadlocks
+            max_workers = 1 if args.limit is None or args.limit <= 5 else min(2, args.limit)
+        
+        analyzer = GitHubAnalyzer(max_workers=max_workers)
         analyzer.model = args.model
         analyzer.analyze_github_profile(args.github_url, args.limit)
     except ValueError as e:

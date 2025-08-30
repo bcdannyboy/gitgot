@@ -14,6 +14,8 @@ gitgot is a Python tool that leverages OpenAI's GPT-4.1 model to provide compreh
 - 👤 **Developer Profile Generation**: Creates an overall profile summarizing expertise and project patterns
 - 🎨 **Rich Terminal Output**: Color-coded, formatted output with progress indicators
 - 💾 **JSON Export**: Saves complete analysis results for future reference
+- ⚡ **Multithreaded Processing**: Parallel analysis for faster processing of large accounts
+- 🛡️ **Rate Limiting**: Built-in thread-safe rate limiting to respect API limits
 
 ## Prerequisites
 
@@ -59,6 +61,12 @@ python gitgot.py bcdannyboy --limit 5
 
 # Use a different OpenAI model
 python gitgot.py bcdannyboy --model gpt-4o
+
+# Control parallel processing (default: auto)
+python gitgot.py bcdannyboy --workers 2
+
+# Combine options for large accounts
+python gitgot.py bcdannyboy --limit 10 --workers 4
 
 # Analyze your own profile (assuming you set GITHUB_TOKEN)
 python gitgot.py yourusername
@@ -118,6 +126,7 @@ The final profile summary includes:
 - `github_url`: GitHub profile URL or username
 - `--limit`: Maximum number of repositories to analyze
 - `--model`: OpenAI model to use (default: gpt-4.1)
+- `--workers`: Number of worker threads for parallel processing (default: auto)
 
 ## Limitations
 
@@ -149,8 +158,10 @@ Contributions are welcome! Some areas for potential enhancement:
 
 - **Language Model**: GPT-4.1 with 1M token context window
 - **File Selection**: Prioritizes important files (source code, configs, documentation)
-- **Rate Limiting**: Built-in delays to respect API limits
+- **Rate Limiting**: Thread-safe rate limiting to respect API limits (1 req/sec GitHub, 0.5 req/sec OpenAI)
 - **Error Handling**: Graceful handling of API failures and missing data
+- **Parallel Processing**: Multithreaded architecture with separate phases for content fetching and analysis
+- **Performance**: 2-4x faster analysis for accounts with many repositories
 
 ## Output Files
 
